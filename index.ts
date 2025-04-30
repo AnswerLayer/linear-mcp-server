@@ -25,6 +25,7 @@ interface CreateIssueArgs {
   description?: string;
   priority?: number;
   status?: string;
+  parentId?: string;
 }
 
 interface UpdateIssueArgs {
@@ -33,6 +34,7 @@ interface UpdateIssueArgs {
   description?: string;
   priority?: number;
   status?: string;
+  parentId?: string;
 }
 
 interface SearchIssuesArgs {
@@ -69,6 +71,7 @@ interface RateLimiterMetrics {
 }
 
 interface LinearIssueResponse {
+  id: string;
   identifier: string;
   title: string;
   priority: number | null;
@@ -210,9 +213,8 @@ class LinearMCPClient {
   private addMetricsToResponse(response: any) {
     const metrics = this.rateLimiter.getMetrics();
     return {
-      ...response,
+      data: response,
       metadata: {
-        ...response.metadata,
         apiMetrics: {
           requestsInLastHour: metrics.requestsInLastHour,
           remainingRequests: this.rateLimiter.requestsPerHour - metrics.requestsInLastHour,
@@ -259,6 +261,13 @@ class LinearMCPClient {
   }
 
   async getIssue(issueId: string) {
+    // Basic check if it looks like a UUID
+    const uuidRegex = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
+    if (!uuidRegex.test(issueId)) {
+      throw new Error(`Invalid input: Expected issue UUID for getIssue, but received '${issueId}'.`);
+    }
+
+    console.error(`[getIssue] Fetching issue with UUID: ${issueId}`);
     const result = await this.rateLimiter.enqueue(() => this.client.issue(issueId));
     if (!result) throw new Error(`Issue ${issueId} not found`);
 
@@ -278,13 +287,32 @@ class LinearMCPClient {
   }
 
   async createIssue(args: CreateIssueArgs) {
-    const issuePayload = await this.client.createIssue({
+    console.error(`[createIssue] Received args:`, JSON.stringify(args));
+    const createPayload: LinearDocument.IssueCreateInput = {
       title: args.title,
       teamId: args.teamId,
       description: args.description,
       priority: args.priority,
-      stateId: args.status
-    });
+      parentId: args.parentId
+    };
+
+    // Look up stateId if status name is provided
+    if (args.status) {
+      console.error(`[createIssue] Status included: ${args.status}`);
+      const team = await this.rateLimiter.enqueue(() => this.client.team(args.teamId));
+      if (!team) {
+        throw new Error(`Team ${args.teamId} not found for creating issue.`);
+      }
+      const states = await this.rateLimiter.enqueue(() => team.states({ filter: { name: { eq: args.status } } }));
+      const state = states.nodes[0];
+      if (!state) {
+        throw new Error(`Status '${args.status}' not found for team ${team.name} (ID: ${args.teamId})`);
+      }
+      createPayload.stateId = state.id;
+    }
+
+    console.error(`[createIssue] Sending create payload:`, JSON.stringify(createPayload));
+    const issuePayload = await this.rateLimiter.enqueue(() => this.client.createIssue(createPayload), 'createIssue');
 
     const issue = await issuePayload.issue;
     if (!issue) throw new Error("Failed to create issue");
@@ -292,51 +320,100 @@ class LinearMCPClient {
   }
 
   async updateIssue(args: UpdateIssueArgs) {
+    console.error(`[updateIssue] Received args:`, JSON.stringify(args));
     const issue = await this.client.issue(args.id);
     if (!issue) throw new Error(`Issue ${args.id} not found`);
 
-    const updatePayload = await issue.update({
-      title: args.title,
-      description: args.description,
-      priority: args.priority,
-      stateId: args.status
-    });
+    const updatePayload: Partial<LinearDocument.IssueUpdateInput> = {};
 
-    const updatedIssue = await updatePayload.issue;
+    if (args.title !== undefined) {
+      updatePayload.title = args.title;
+    }
+    if (args.description !== undefined) {
+      console.error(`[updateIssue] Description included: length=${args.description.length}`);
+      updatePayload.description = args.description;
+    }
+    if (args.priority !== undefined) {
+      updatePayload.priority = args.priority;
+    }
+    if (args.parentId !== undefined) {
+      updatePayload.parentId = args.parentId;
+    }
+
+    // Look up stateId if status name is provided
+    if (args.status) {
+      console.error(`[updateIssue] Status included: ${args.status}`);
+      const team = await this.rateLimiter.enqueue(async () => {
+        const t = await issue.team;
+        if (!t) throw new Error(`Issue ${args.id} does not have an associated team.`);
+        return t;
+      });
+
+      if (!team) {
+        throw new Error(`Could not find team for issue ${args.id}`);
+      }
+      const states = await this.rateLimiter.enqueue(() => team.states({ filter: { name: { eq: args.status } } }));
+      const state = states.nodes[0];
+      if (!state) {
+        throw new Error(`Status '${args.status}' not found for team ${team.name}`);
+      }
+      updatePayload.stateId = state.id;
+    }
+
+    // Only call update if there's something to update
+    if (Object.keys(updatePayload).length === 0) {
+      console.error("No fields provided to update.");
+      return issue; // Return original issue if no updates specified
+    }
+
+    console.error(`[updateIssue] Sending update payload:`, JSON.stringify(updatePayload));
+    const updateResult = await this.rateLimiter.enqueue(() => issue.update(updatePayload), 'updateIssue');
+
+    const updatedIssue = await updateResult.issue;
     if (!updatedIssue) throw new Error("Failed to update issue");
     return updatedIssue;
   }
 
   async searchIssues(args: SearchIssuesArgs) {
+    console.error(`[searchIssues] Received args:`, JSON.stringify(args));
+    const filter = this.buildSearchFilter(args);
+    console.error(`[searchIssues] Built filter:`, JSON.stringify(filter));
+
+    console.error(`[searchIssues] Calling client.issues...`);
     const result = await this.rateLimiter.enqueue(() =>
       this.client.issues({
-        filter: this.buildSearchFilter(args),
+        filter: filter,
         first: args.limit || 10,
         includeArchived: args.includeArchived
-      })
+      }),
+      'searchIssues'
     );
+    console.error(`[searchIssues] client.issues returned ${result.nodes.length} nodes.`);
 
-    const issuesWithDetails = await this.rateLimiter.batch(result.nodes, 5, async (issue) => {
-      const [state, assignee, labels] = await Promise.all([
-        this.rateLimiter.enqueue(() => issue.state) as Promise<WorkflowState>,
-        this.rateLimiter.enqueue(() => issue.assignee) as Promise<User>,
-        this.rateLimiter.enqueue(() => issue.labels()) as Promise<{ nodes: IssueLabel[] }>
-      ]);
+    // Process results directly, accessing relations from the issue nodes.
+    // Use Promise.all to handle async fetching of details for each issue.
+    const issuesWithDetails = await Promise.all(result.nodes.map(async (issue) => {
+      // Access related data directly, await if they are promises/methods
+      const state = await issue.state;       // Access state relation
+      const assignee = await issue.assignee;   // Access assignee relation
+      const labelsResult = await issue.labels(); // Call labels method
 
       return {
         id: issue.id,
         identifier: issue.identifier,
         title: issue.title,
-        description: issue.description,
+        description: issue.description, // Include description
         priority: issue.priority,
         estimate: issue.estimate,
         status: state?.name || null,
         assignee: assignee?.name || null,
-        labels: labels?.nodes?.map((label: IssueLabel) => label.name) || [],
+        labels: labelsResult?.nodes?.map((label: IssueLabel) => label.name) || [],
         url: issue.url
       };
-    });
+    }));
+    // Removed the inefficient rateLimiter.batch call
 
+    // Return the object with data and metadata
     return this.addMetricsToResponse(issuesWithDetails);
   }
 
@@ -479,6 +556,40 @@ class LinearMCPClient {
     });
   }
 
+  // Method to expose organization details including teams
+  async getOrganizationDetails() {
+    return this.getOrganization(); // Reuse existing private method logic
+  }
+
+  // Method to archive (delete) an issue - accepts UUID or identifier
+  async archiveIssue(idOrIdentifier: string) {
+    console.error(`[archiveIssue] Received idOrIdentifier: ${idOrIdentifier}`);
+    let issueId: string;
+
+    // Basic check if it looks like a UUID
+    const uuidRegex = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
+    if (uuidRegex.test(idOrIdentifier)) {
+      issueId = idOrIdentifier;
+    } else {
+      // Use helper to get UUID from identifier
+      console.error(`[archiveIssue] Input is not UUID, looking up identifier: ${idOrIdentifier}`);
+      issueId = await this._getIdFromIdentifier(idOrIdentifier);
+    }
+
+    // Use the client's archiveIssue method with the resolved UUID
+    console.error(`[archiveIssue] Archiving issue with UUID: ${issueId}`);
+    const result = await this.rateLimiter.enqueue(() => 
+      this.client.archiveIssue(issueId), 
+      'archiveIssue'
+    );
+    console.error(`[archiveIssue] Result:`, JSON.stringify(result)); // Log result
+    // Check for success, Linear SDK often returns { success: boolean }
+    if (!result?.success) {
+      throw new Error(`Failed to archive issue ${issueId}. Result: ${JSON.stringify(result)}`);
+    }
+    return { success: true, issueId };
+  }
+
   private buildSearchFilter(args: SearchIssuesArgs): any {
     const filter: any = {};
 
@@ -519,19 +630,45 @@ class LinearMCPClient {
 
     return filter;
   }
+
+  // Helper to get UUID from identifier using client.issue()
+  private async _getIdFromIdentifier(identifier: string): Promise<string> {
+    console.error(`[_getIdFromIdentifier] Looking up issue via client.issue with identifier: ${identifier}`);
+    try {
+      // Use the singular client.issue() which might accept identifier string
+      const issue = await this.rateLimiter.enqueue(() => 
+        this.client.issue(identifier),
+        'getIdFromIdentifier'
+      );
+
+      if (!issue) {
+        throw new Error(`No issue found with identifier '${identifier}' using client.issue().`);
+      }
+
+      // client.issue() should return the full issue object, including the UUID id
+      const issueId = issue.id;
+      console.error(`[_getIdFromIdentifier] Found UUID: ${issueId}`);
+      return issueId;
+    } catch (error) {
+      console.error(`[_getIdFromIdentifier] Error fetching UUID for ${identifier}:`, error);
+      // Re-throw potentially more specific error or a generic one
+      throw new Error(`Failed to find issue UUID for identifier '${identifier}'.`);
+    }
+  }
 }
 
 const createIssueTool: Tool = {
   name: "linear_create_issue",
-  description: "Creates a new Linear issue with specified details. Use this to create tickets for tasks, bugs, or feature requests. Returns the created issue's identifier and URL. Required fields are title and teamId, with optional description, priority (0-4, where 0 is no priority and 1 is urgent), and status.",
+  description: "Creates a new Linear issue with specified details. Use this to create tickets for tasks, bugs, or feature requests. Returns the created issue's identifier and URL. Required fields are title and teamId, with optional description, priority (0-4), status, and parentId.",
   inputSchema: {
     type: "object",
     properties: {
       title: { type: "string", description: "Issue title" },
       teamId: { type: "string", description: "Team ID" },
-      description: { type: "string", description: "Issue description" },
-      priority: { type: "number", description: "Priority (0-4)" },
-      status: { type: "string", description: "Issue status" }
+      description: { type: "string", description: "Issue description", optional: true },
+      priority: { type: "number", description: "Priority (0-4)", optional: true },
+      status: { type: "string", description: "Issue status", optional: true },
+      parentId: { type: "string", description: "Optional UUID of the parent issue", optional: true }
     },
     required: ["title", "teamId"]
   }
@@ -539,15 +676,16 @@ const createIssueTool: Tool = {
 
 const updateIssueTool: Tool = {
   name: "linear_update_issue",
-  description: "Updates an existing Linear issue's properties. Use this to modify issue details like title, description, priority, or status. Requires the issue ID and accepts any combination of updatable fields. Returns the updated issue's identifier and URL.",
+  description: "Updates an existing Linear issue's properties. Use this to modify issue details like title, description, priority, status, or parent issue. Requires the issue ID and accepts any combination of updatable fields. Returns the updated issue's identifier and URL.",
   inputSchema: {
     type: "object",
     properties: {
       id: { type: "string", description: "Issue ID" },
-      title: { type: "string", description: "New title" },
-      description: { type: "string", description: "New description" },
-      priority: { type: "number", description: "New priority (0-4)" },
-      status: { type: "string", description: "New status" }
+      title: { type: "string", description: "New title", optional: true },
+      description: { type: "string", description: "New description", optional: true },
+      priority: { type: "number", description: "New priority (0-4)", optional: true },
+      status: { type: "string", description: "New status", optional: true },
+      parentId: { type: "string", description: "Optional UUID of the parent issue", optional: true }
     },
     required: ["id"]
   }
@@ -613,6 +751,40 @@ const addCommentTool: Tool = {
       displayIconUrl: { type: "string", description: "Optional avatar URL for the comment" }
     },
     required: ["issueId", "body"]
+  }
+};
+
+const getOrganizationDetailsTool: Tool = {
+  name: "linear_get_organization_details",
+  description: "Retrieves details about the Linear organization, including teams and users associated with the API key.",
+  inputSchema: { // No input arguments needed
+    type: "object",
+    properties: {}
+  }
+};
+
+const archiveIssueTool: Tool = {
+  name: "linear_archive_issue",
+  description: "Archives (soft-deletes) a Linear issue using its UUID. Archived issues are hidden but can usually be restored.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      id: { type: "string", description: "UUID of the issue to archive" }
+    },
+    required: ["id"]
+  }
+};
+
+// Define the new get issue tool
+const getIssueTool: Tool = {
+  name: "linear_get_issue",
+  description: "Retrieves details for a specific Linear issue using its UUID.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      id: { type: "string", description: "UUID of the issue to retrieve" }
+    },
+    required: ["id"]
   }
 };
 
@@ -765,7 +937,8 @@ const CreateIssueArgsSchema = z.object({
   teamId: z.string().describe("Team ID"),
   description: z.string().optional().describe("Issue description"),
   priority: z.number().min(0).max(4).optional().describe("Priority (0-4)"),
-  status: z.string().optional().describe("Issue status")
+  status: z.string().optional().describe("Issue status"),
+  parentId: z.string().uuid("Parent issue UUID must be a valid UUID.").optional().describe("Optional UUID of the parent issue")
 });
 
 const UpdateIssueArgsSchema = z.object({
@@ -773,7 +946,8 @@ const UpdateIssueArgsSchema = z.object({
   title: z.string().optional().describe("New title"),
   description: z.string().optional().describe("New description"),
   priority: z.number().optional().describe("New priority (0-4)"),
-  status: z.string().optional().describe("New status")
+  status: z.string().optional().describe("New status"),
+  parentId: z.string().uuid("Parent issue ID must be a valid UUID.").optional().describe("Optional UUID of the parent issue")
 });
 
 const SearchIssuesArgsSchema = z.object({
@@ -904,7 +1078,16 @@ async function main() {
     });
 
     server.setRequestHandler(ListToolsRequestSchema, async () => ({
-      tools: [createIssueTool, updateIssueTool, searchIssuesTool, getUserIssuesTool, addCommentTool]
+      tools: [
+        createIssueTool, 
+        updateIssueTool, 
+        searchIssuesTool, 
+        getUserIssuesTool, 
+        addCommentTool,
+        getOrganizationDetailsTool,
+        archiveIssueTool,
+        getIssueTool
+      ]
     }));
 
     server.setRequestHandler(ListResourceTemplatesRequestSchema, async () => {
@@ -979,33 +1162,35 @@ async function main() {
 
           case "linear_search_issues": {
             const validatedArgs = SearchIssuesArgsSchema.parse(args);
-            const issues = await linearClient.searchIssues(validatedArgs);
+            // Result is now an object { data: issuesArray, metadata: ... }
+            const result = await linearClient.searchIssues(validatedArgs);
             return {
               content: [{
                 type: "text",
-                text: `Found ${issues.length} issues:\n${
-                  issues.map((issue: LinearIssueResponse) =>
-                    `- ${issue.identifier}: ${issue.title}\n  Priority: ${issue.priority || 'None'}\n  Status: ${issue.status || 'None'}\n  ${issue.url}`
+                text: `Found ${result.data.length} issues:\n${
+                  result.data.map((issue: LinearIssueResponse) => // Access data property
+                    `- ${issue.identifier}: ${issue.title}\n  Priority: ${issue.priority || 'None'}\n  Status: ${issue.status || 'None'}\n  URL: ${issue.url}\n  ID: ${issue.id}` // Add ID here
                   ).join('\n')
                 }`,
-                metadata: baseResponse
+                metadata: result.metadata // Attach the metadata object
               }]
             };
           }
 
           case "linear_get_user_issues": {
             const validatedArgs = GetUserIssuesArgsSchema.parse(args);
-            const issues = await linearClient.getUserIssues(validatedArgs);
+            // Apply the same pattern here for consistency
+            const result = await linearClient.getUserIssues(validatedArgs);
 
             return {
               content: [{
                 type: "text",
-                text: `Found ${issues.length} issues:\n${
-                  issues.map((issue: LinearIssueResponse) =>
+                text: `Found ${result.data.length} issues:\n${
+                  result.data.map((issue: LinearIssueResponse) => // Access data property
                     `- ${issue.identifier}: ${issue.title}\n  Priority: ${issue.priority || 'None'}\n  Status: ${issue.stateName}\n  ${issue.url}`
                   ).join('\n')
                 }`,
-                metadata: baseResponse
+                metadata: result.metadata // Attach the metadata object
               }]
             };
           }
@@ -1013,12 +1198,61 @@ async function main() {
           case "linear_add_comment": {
             const validatedArgs = AddCommentArgsSchema.parse(args);
             const { comment, issue } = await linearClient.addComment(validatedArgs);
-
+            // Use baseResponse for metadata here as before
             return {
               content: [{
                 type: "text",
                 text: `Added comment to issue ${issue?.identifier}\nURL: ${comment.url}`,
+                metadata: baseResponse // Use baseResponse, not result.metadata
+              }]
+            };
+          }
+
+          case "linear_get_organization_details": {
+            const result = await linearClient.getOrganizationDetails();
+            return {
+              content: [{
+                type: "text",
+                text: JSON.stringify(result.data, null, 2),
+                metadata: result.metadata
+              }]
+            };
+          }
+
+          case "linear_archive_issue": {
+            // Relax validation to allow UUID or identifier string
+            const ArchiveIssueArgsSchema = z.object({ id: z.string().min(1, "Issue ID or identifier cannot be empty.") });
+            const validatedArgs = ArchiveIssueArgsSchema.parse(args);
+            const result = await linearClient.archiveIssue(validatedArgs.id);
+            const metrics = linearClient.rateLimiter.getMetrics();
+            const baseResponse: MCPMetricsResponse = {
+              apiMetrics: {
+                requestsInLastHour: metrics.requestsInLastHour,
+                remainingRequests: linearClient.rateLimiter.requestsPerHour - metrics.requestsInLastHour,
+                averageRequestTime: `${Math.round(metrics.averageRequestTime)}ms`,
+                queueLength: metrics.queueLength
+              }
+            };
+            return {
+              content: [{
+                type: "text",
+                text: `Archived issue ${result.issueId}`,
                 metadata: baseResponse
+              }]
+            };
+          }
+
+          case "linear_get_issue": {
+            // Relax validation to allow UUID or identifier string
+            const GetIssueArgsSchema = z.object({ id: z.string().min(1, "Issue ID or identifier cannot be empty.") });
+            const validatedArgs = GetIssueArgsSchema.parse(args);
+            const result = await linearClient.getIssue(validatedArgs.id);
+            // Result already includes data and metadata via addMetricsToResponse used in getIssue
+            return {
+              content: [{
+                type: "text",
+                text: JSON.stringify(result.data, null, 2), // Return the data part as JSON string
+                metadata: result.metadata
               }]
             };
           }
