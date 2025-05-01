@@ -376,8 +376,58 @@ class LinearMCPClient {
 
   async searchIssues(args: SearchIssuesArgs) {
     console.error(`[searchIssues] Received args:`, JSON.stringify(args));
-    const filter = this.buildSearchFilter(args);
-    console.error(`[searchIssues] Built filter:`, JSON.stringify(filter));
+
+    // Check if the query looks like a Linear identifier (e.g., TEAM-123)
+    const identifierRegex = /^[A-Z]+-[0-9]+$/i; // Case-insensitive
+    let directIssueFound: Issue | null = null;
+
+    if (args.query && identifierRegex.test(args.query)) {
+      console.error(`[searchIssues] Query '${args.query}' matches identifier pattern. Trying direct lookup...`);
+      try {
+        directIssueFound = await this.rateLimiter.enqueue(
+          () => this.client.issue(args.query as string), // Assuming client.issue accepts identifier
+          'searchIssuesByIdentifier'
+        );
+        if (directIssueFound) {
+          console.error(`[searchIssues] Found issue directly via identifier: ${directIssueFound.identifier}`);
+        } else {
+           console.error(`[searchIssues] Direct lookup for identifier '${args.query}' returned no issue.`);
+        }
+      } catch (error) {
+        // Log the error but allow fallback to general search
+        console.error(`[searchIssues] Error during direct identifier lookup for '${args.query}':`, error instanceof Error ? error.message : error);
+        // Ensure directIssueFound is null so we proceed to general search
+        directIssueFound = null; 
+      }
+    }
+
+    // If direct lookup succeeded, format and return that single issue
+    if (directIssueFound) {
+        const issue = directIssueFound; // Assign for clarity
+        const state = await issue.state;
+        const assignee = await issue.assignee;
+        const labelsResult = await issue.labels();
+
+        const issueDetails = {
+            id: issue.id,
+            identifier: issue.identifier,
+            title: issue.title,
+            description: issue.description,
+            priority: issue.priority,
+            estimate: issue.estimate,
+            status: state?.name || null,
+            assignee: assignee?.name || null,
+            labels: labelsResult?.nodes?.map((label: IssueLabel) => label.name) || [],
+            url: issue.url
+        };
+        // Return the single found issue in the expected format
+        return this.addMetricsToResponse([issueDetails]); 
+    }
+
+    // If no direct match or query wasn't an identifier, proceed with filter-based search
+    console.error(`[searchIssues] Proceeding with filter-based search for query: ${args.query}`);
+    const filter = this.buildSearchFilter(args); // buildSearchFilter should now only include title/desc for query
+    console.error(`[searchIssues] Built filter for general search:`, JSON.stringify(filter));
 
     console.error(`[searchIssues] Calling client.issues...`);
     const result = await this.rateLimiter.enqueue(() =>
@@ -594,9 +644,11 @@ class LinearMCPClient {
     const filter: any = {};
 
     if (args.query) {
+      // Identifier search is handled separately now, only search title/description here
       filter.or = [
         { title: { contains: args.query } },
         { description: { contains: args.query } }
+        // { identifier: { eq: args.query } } // REMOVED - Handled in searchIssues directly
       ];
     }
 
