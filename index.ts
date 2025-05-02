@@ -261,28 +261,43 @@ class LinearMCPClient {
   }
 
   async getIssue(issueId: string) {
-    // Basic check if it looks like a UUID
-    const uuidRegex = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
-    if (!uuidRegex.test(issueId)) {
-      throw new Error(`Invalid input: Expected issue UUID for getIssue, but received '${issueId}'.`);
-    }
+    console.error(`[getIssue] Fetching issue with ID or Identifier: ${issueId}`);
+    // Assuming client.issue() handles both UUIDs and identifiers
+    const issue = await this.rateLimiter.enqueue(() => this.client.issue(issueId)); 
+    if (!issue) throw new Error(`Issue ${issueId} not found`);
 
-    console.error(`[getIssue] Fetching issue with UUID: ${issueId}`);
-    const result = await this.rateLimiter.enqueue(() => this.client.issue(issueId));
-    if (!result) throw new Error(`Issue ${issueId} not found`);
+    // Fetch related details concurrently
+    const [state, assignee, team, commentsResult] = await Promise.all([
+      this.rateLimiter.enqueue(async () => issue.state ? await issue.state : null),
+      this.rateLimiter.enqueue(async () => issue.assignee ? await issue.assignee : null),
+      this.rateLimiter.enqueue(async () => issue.team ? await issue.team : null),
+      this.rateLimiter.enqueue(() => issue.comments({ first: 50 }), 'getIssueComments') // Fetch comments
+    ]);
 
-    const details = await this.getIssueDetails(result);
+    // Fetch user details for each comment
+    const commentsWithUsers = await Promise.all(
+      commentsResult.nodes.map(async (comment) => {
+        const user = await this.rateLimiter.enqueue(async () => comment.user ? await comment.user : null);
+        return {
+          id: comment.id,
+          body: comment.body,
+          createdAt: comment.createdAt,
+          user: user ? { id: user.id, name: user.name } : null,
+        };
+      })
+    );
 
     return this.addMetricsToResponse({
-      id: result.id,
-      identifier: result.identifier,
-      title: result.title,
-      description: result.description,
-      priority: result.priority,
-      status: details.state?.name,
-      assignee: details.assignee?.name,
-      team: details.team?.name,
-      url: result.url
+      id: issue.id,
+      identifier: issue.identifier,
+      title: issue.title,
+      description: issue.description,
+      priority: issue.priority,
+      status: state?.name,
+      assignee: assignee?.name,
+      team: team?.name,
+      url: issue.url,
+      comments: commentsWithUsers.sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime()) // Add comments, sorted oldest first
     });
   }
 
@@ -508,8 +523,26 @@ class LinearMCPClient {
   }
 
   async addComment(args: AddCommentArgs) {
+    let resolvedIssueId = args.issueId;
+
+    // Check if the provided ID looks like an identifier rather than a UUID
+    const uuidRegex = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
+    if (!uuidRegex.test(args.issueId)) {
+      console.error(`[addComment] Input '${args.issueId}' is not UUID, attempting to resolve identifier...`);
+      try {
+        // Reuse the existing helper to get UUID from identifier
+        resolvedIssueId = await this._getIdFromIdentifier(args.issueId);
+        console.error(`[addComment] Resolved identifier '${args.issueId}' to UUID '${resolvedIssueId}'`);
+      } catch (error) {
+        console.error(`[addComment] Failed to resolve identifier '${args.issueId}':`, error);
+        // Re-throw the error as we cannot proceed without a valid UUID
+        throw new Error(`Failed to find issue with identifier '${args.issueId}'. Cannot add comment.`);
+      }
+    }
+
+    console.error(`[addComment] Adding comment to issue UUID: ${resolvedIssueId}`);
     const commentPayload = await this.client.createComment({
-      issueId: args.issueId,
+      issueId: resolvedIssueId, // Use the resolved UUID
       body: args.body,
       createAsUser: args.createAsUser,
       displayIconUrl: args.displayIconUrl
@@ -519,10 +552,11 @@ class LinearMCPClient {
     if (!comment) throw new Error("Failed to create comment");
 
     const issue = await comment.issue;
+    // Return the comment and the original issue object (fetched implicitly by comment.issue)
     return {
       comment,
-      issue
-    };
+      issue // issue object will contain details fetched by the SDK
+    }; 
   }
 
   async getTeamIssues(teamId: string) {
