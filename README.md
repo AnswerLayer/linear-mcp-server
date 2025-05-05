@@ -1,138 +1,131 @@
 # Linear MCP Server
 
-[![npm version](https://img.shields.io/npm/v/linear-mcp-server.svg)](https://www.npmjs.com/package/linear-mcp-server) [![smithery badge](https://smithery.ai/badge/linear-mcp-server)](https://smithery.ai/server/linear-mcp-server)
+[![npm version](https://img.shields.io/npm/v/@linear/sdk.svg)](https://www.npmjs.com/package/@linear/sdk)
 
 A [Model Context Protocol](https://github.com/modelcontextprotocol) server for the [Linear API](https://developers.linear.app/docs/graphql/working-with-the-graphql-api).
 
 This server provides integration with Linear's issue tracking system through MCP, allowing LLMs to interact with Linear issues.
 
-## Installation
+## Installation & Setup
 
-### Automatic Installation
+This server is designed to be run locally after cloning the repository.
 
-To install the Linear MCP server for Claude Desktop automatically via [Smithery](https://smithery.ai/protocol/linear-mcp-server):
+1.  **Clone the Repository:**
+    ```bash
+    git clone <your-repository-url>
+    cd linear-mcp-server-fork # Or your repository name
+    ```
 
-```bash
-npx @smithery/cli install linear-mcp-server --client claude
-```
+2.  **Install Dependencies:**
+    ```bash
+    npm install
+    ```
 
-### Manual Installation
+3.  **Configure API Key:** Create a `.env` file in the root directory and add your Linear API key:
+    ```bash
+    # .env
+    LINEAR_API_KEY=your_linear_api_key_here
+    ```
+    *   Get keys from: `https://linear.app/<YOUR-TEAM>/settings/api`
 
-1. Create or get a Linear API key for your team: [https://linear.app/YOUR-TEAM/settings/api](https://linear.app/YOUR-TEAM/settings/api)
+4.  **Build the Server:**
+    ```bash
+    npm run build
+    ```
 
-2. Add server config to Claude Desktop:
-   - MacOS: `~/Library/Application Support/Claude/claude_desktop_config.json`
-
-```json
-{
-  "mcpServers": {
-    "linear": {
-      "command": "npx",
-      "args": [
-        "-y",
-        "linear-mcp-server"
-      ],
-      "env": {
-        "LINEAR_API_KEY": "your_linear_api_key_here"
+5.  **Configure your MCP Client (e.g., Cursor, Claude Desktop):**
+    Point your client to run the built server script. Example for Cursor (`.cursor/mcp.json`):
+    ```json
+    {
+      "mcpServers": {
+        "linear": {
+          "command": "node",
+          "args": [
+            "/path/to/your/linear-mcp-server-fork/build/index.js" // Adjust path as needed
+          ],
+          "env": {
+            // Optionally override .env key here, or rely on .env file
+            // "LINEAR_API_KEY": "your_linear_api_key_here"
+          }
+        }
       }
     }
-  }
-}
-```
+    ```
+    *(Adapt the configuration for your specific MCP client)*
 
 ## Components
 
 ### Tools
 
-1. **`linear_create_issue`**: Create a new Linear issues
-   - Required inputs:
-     - `title` (string): Issue title
-     - `teamId` (string): Team ID to create issue in
-   - Optional inputs:
-     - `description` (string): Issue description (markdown supported)
-     - `priority` (number, 0-4): Priority level (1=urgent, 4=low)
-     - `status` (string): Initial status name
+1.  **`linear_create_issue`**: Create a new Linear issue.
+    *   Required: `title`, `teamId`
+    *   Optional: `description` (markdown), `priority` (0-4), `status`, `parentId`
 
-2. **`linear_update_issue`**: Update existing issues
-   - Required inputs:
-     - `id` (string): Issue ID to update
-   - Optional inputs:
-     - `title` (string): New title
-     - `description` (string): New description
-     - `priority` (number, 0-4): New priority
-     - `status` (string): New status name
+2.  **`linear_update_issue`**: Update an existing issue.
+    *   Required: `id` (UUID or Identifier like `PROJ-123`)
+    *   Optional: `title`, `description`, `priority` (0-4), `status`, `parentId`
 
-3. **`linear_search_issues`**: Search issues with flexible filtering
-   - Optional inputs:
-     - `query` (string): Text to search in title/description
-     - `teamId` (string): Filter by team
-     - `status` (string): Filter by status
-     - `assigneeId` (string): Filter by assignee
-     - `labels` (string[]): Filter by labels
-     - `priority` (number): Filter by priority
-     - `limit` (number, default: 10): Max results
+3.  **`linear_search_issues`**: Search issues with flexible filtering. Handles direct identifier lookup (e.g., `PROJ-123`) first, then falls back to text search.
+    *   Optional:
+        *   `query` (string): Identifier or text for title/description
+        *   `teamId`, `status`, `assigneeId`, `labels` (string[]), `priority`, `estimate`, `includeArchived`, `limit` (default: 10)
 
-4. **`linear_get_user_issues`**: Get issues assigned to a user
-   - Optional inputs:
-     - `userId` (string): User ID (omit for authenticated user)
-     - `includeArchived` (boolean): Include archived issues
-     - `limit` (number, default: 50): Max results
+4.  **`linear_get_user_issues`**: Get issues assigned to a user.
+    *   Optional: `userId` (omit for authenticated user), `includeArchived`, `limit` (default: 50)
 
-5. **`linear_add_comment`**: Add comments to issues
-   - Required inputs:
-     - `issueId` (string): Issue ID to comment on
-     - `body` (string): Comment text (markdown supported)
-   - Optional inputs:
-     - `createAsUser` (string): Custom username
-     - `displayIconUrl` (string): Custom avatar URL
+5.  **`linear_add_comment`**: Add comments to issues.
+    *   Required: `issueId` (UUID or Identifier like `PROJ-123`), `body` (markdown)
+    *   Optional: `createAsUser`, `displayIconUrl`
 
-### Resources
+6.  **`linear_get_issue`**: Retrieve details for a specific issue, **including comments**.
+    *   Required: `id` (UUID or Identifier like `PROJ-123`)
 
-- `linear-issue:///{issueId}` - View individual issue details
-- `linear-team:///{teamId}/issues` - View team issues
-- `linear-user:///{userId}/assigned` - View user's assigned issues
-- `linear-organization:` - View organization info
-- `linear-viewer:` - View current user context
+7.  **`linear_get_organization_details`**: Retrieve organization details (teams, users).
+    *   No required arguments.
+
+8.  **`linear_archive_issue`**: Archive (soft-delete) an issue.
+    *   Required: `id` (UUID or Identifier like `PROJ-123`)
+
+### Resources (Examples for `ReadResourceRequest`)
+
+*   `linear-issue:///{issueId}` - View individual issue details (using UUID).
+*   `linear-team:///{teamId}/issues` - View team issues.
+*   `linear-user:///{userId}/assigned` - View user's assigned issues.
+*   `linear-organization:` - View organization info.
+*   `linear-viewer:` - View current user context.
+
+*(Note: Reading resources might not reflect all recent code changes, e.g., comment fetching in `linear-issue:///` might require specific implementation)*
 
 ## Usage examples
 
-Some example prompts you can use with Claude Desktop to interact with Linear:
+Some example prompts you can use with your MCP client:
 
-1. "Show me all my high-**priority** issues" → execute the `search_issues` tool and/or `linear-user:///{userId}/assigned` to find issues assigned to you with priority 1
-
-2. "Based on what I've told you about this bug already, make a bug report for the authentication system" → use `create_issue` to create a new high-priority issue with appropriate details and status tracking
-
-3. "Find all in progress frontend tasks" → use `search_issues` to locate frontend-related issues with in progress task
-
-4. "Give me a summary of recent updates on the issues for mobile app development" → use `search_issues` to identify the relevant issue(s), then `linear-issue:///{issueId}` fetch the issue details and show recent activity and comments
-
-5. "What's the current workload for the mobile team?" → combine `linear-team:///{teamId}/issues` and `search_issues` to analyze issue distribution and priorities across the mobile team
+1.  "Show me my high-priority issues" → `linear_get_user_issues` or `linear_search_issues` with appropriate filters.
+2.  "Create a bug report for the login system titled 'Login fails with incorrect password'." → `linear_create_issue` with title, description, teamId, priority.
+3.  "Find issue PROJ-123" → `linear_search_issues` with `query: "PROJ-123"`.
+4.  "Get the details and comments for issue PROJ-456" → `linear_get_issue` with `id: "PROJ-456"`.
+5.  "Add a comment to PROJ-789 saying 'Investigating this now.'" → `linear_add_comment` with `issueId: "PROJ-789"` and body.
+6.  "What teams are in this organization?" → `linear_get_organization_details`.
 
 ## Development
 
-1. Install dependencies:
-
-```bash
-npm install
-```
-
-1. Configure Linear API key in `.env`:
-
-```bash
-LINEAR_API_KEY=your_api_key_here
-```
-
-1. Build the server:
-
-```bash
-npm run build
-```
-
-For development with auto-rebuild:
-
-```bash
-npm run watch
-```
+1.  **Install Dependencies:**
+    ```bash
+    npm install
+    ```
+2.  **Configure API Key:** Create/update `.env` file:
+    ```bash
+    LINEAR_API_KEY=your_api_key_here
+    ```
+3.  **Build:**
+    ```bash
+    npm run build
+    ```
+4.  **Watch Mode (Auto-rebuild on changes):**
+    ```bash
+    npm run watch
+    ```
+    *(Remember to restart the server process in your MCP client after builds/changes if not running directly from source)*
 
 ## License
 
